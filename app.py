@@ -7,8 +7,8 @@ from dataclasses import dataclass, field
 from typing import Optional
 from openai import OpenAI
 
-# ── Constants ─────────────────────────────────────────────────────────────────
-API_BASE_URL = "https://platform.beeknoee.com/api/v1"
+# ── Constants ─────────────────────────────────
+PRIMARY_BASE_URL = "https://platform.beeknoee.com/api/v1"
 
 SYSTEM_PROMPT = """Bạn là dịch giả tiểu thuyết tiên hiệp Trung Hoa sang tiếng Việt hàng đầu. Yêu cầu BẮT BUỘC:
 - Chỉ trả về bản dịch tiếng Việt.
@@ -29,17 +29,21 @@ Yêu cầu BẮT BUỘC:
 - Không dùng từ hiện đại, tiếng lóng."""
 
 CJK_RE = re.compile(
-    r'[\u4e00-\u9fff'
-    r'\u3400-\u4dbf'
-    r'\uf900-\ufaff'
-    r'\u2e80-\u2eff'
-    r'\u31c0-\u31ef'
-    r'\U00020000-\U0002a6df'
-    r']+'
+    r'[\u4e00-\u9fff\u3400-\u4dbf\uf900-\ufaff'
+    r'\u2e80-\u2eff\u31c0-\u31ef\U00020000-\U0002a6df]+'
 )
 
+@dataclass
+class Provider:
+    name: str
+    base_url: str
+    api_key: str
+    model: str
+    enabled: bool = True
 
-# ── Data model ────────────────────────────────────────────────────────────────
+    def client(self) -> OpenAI:
+        return OpenAI(api_key=self.api_key, base_url=self.base_url)
+
 @dataclass
 class FileResult:
     name: str
@@ -57,8 +61,6 @@ class FileResult:
     def final_text(self):
         return self.fixed if self.fixed else self.translated
 
-
-# ── Helpers ───────────────────────────────────────────────────────────────────
 def split_text(text: str, chunk_size: int) -> list:
     paragraphs = text.splitlines()
     chunks, current, size = [], [], 0
@@ -73,7 +75,6 @@ def split_text(text: str, chunk_size: int) -> list:
         chunks.append("\n".join(current))
     return [c for c in chunks if c.strip()]
 
-
 def call_api(client: OpenAI, model: str, text: str, system: str = SYSTEM_PROMPT) -> str:
     resp = client.chat.completions.create(
         model=model,
@@ -85,24 +86,36 @@ def call_api(client: OpenAI, model: str, text: str, system: str = SYSTEM_PROMPT)
     )
     return resp.choices[0].message.content
 
+def call_with_fallback(providers: list, text: str, system: str = SYSTEM_PROMPT, status_ph=None) -> tuple:
+    last_error = None
+    for prov in providers:
+        if not prov.enabled:
+            continue
+        for attempt in range(2):
+            try:
+                result = call_api(prov.client(), prov.model, text, system)
+                return result, prov.name, None
+            except Exception as e:
+                msg = str(e)
+                if ("rate" in msg.lower() or "429" in msg) and attempt == 0:
+                    wait = 20
+                    if status_ph:
+                        status_ph.warning(f"⚠️ [{prov.name}] Rate limit — chờ {wait}s…")
+                    time.sleep(wait)
+                else:
+                    last_error = f"[{prov.name}] {msg}"
+                    if status_ph:
+                        status_ph.warning(f"⚠️ {last_error} → thử provider tiếp theo…")
+                    break
+    return "", None, last_error
 
-def api_with_retry(client: OpenAI, model: str, text: str,
-                   system: str = SYSTEM_PROMPT,
-                   status_ph=None) -> tuple:
-    for attempt in range(3):
-        try:
-            return call_api(client, model, text, system), None
-        except Exception as e:
-            msg = str(e)
-            if "rate" in msg.lower() or "429" in msg:
-                wait = 30 * (attempt + 1)
-                if status_ph:
-                    status_ph.warning(f"⚠️ Rate limit — chờ {wait}s…")
-                time.sleep(wait)
-            else:
-                return "", msg
-    return "", "Lỗi sau 3 lần thử"
-
+def fetch_models(api_key: str, base_url: str) -> list:
+    try:
+        client = OpenAI(api_key=api_key, base_url=base_url)
+        models = client.models.list()
+        return sorted([m.id for m in models.data])
+    except Exception:
+        return []
 
 def find_han_segments(text: str) -> list:
     result = []
@@ -110,7 +123,6 @@ def find_han_segments(text: str) -> list:
         if CJK_RE.search(line) and line.strip():
             result.append((i, line))
     return result
-
 
 def build_zip(results: list) -> bytes:
     buf = io.BytesIO()
@@ -122,132 +134,111 @@ def build_zip(results: list) -> bytes:
     buf.seek(0)
     return buf.read()
 
-
-def fetch_models(api_key: str) -> list:
-    """Fetch available models from the API."""
-    try:
-        client = OpenAI(api_key=api_key, base_url=API_BASE_URL)
-        models = client.models.list()
-        ids = sorted([m.id for m in models.data])
-        return ids
-    except Exception as e:
-        return []
-
-
-# ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(page_title="Dịch Thuật Tiên Hiệp", page_icon="⚔️", layout="wide")
 
 st.markdown("""
 <style>
-:root { --red:#c0392b; --dark:#1e1e2e; --text:#cdd6f4; --border:#313244; }
-.main-title { text-align:center; font-size:2.2rem; font-weight:800; color:var(--red); margin-bottom:0; }
-.sub-title   { text-align:center; color:#7f8c8d; font-style:italic; margin-top:0; margin-bottom:1.2rem; }
-.result-box  {
-    background:var(--dark); color:var(--text);
-    padding:1rem 1.2rem; border-radius:10px;
-    font-size:.92rem; line-height:1.75;
-    white-space:pre-wrap; max-height:420px; overflow-y:auto;
-    border:1px solid var(--border);
-}
-.stat-row { display:flex; gap:1rem; margin:.5rem 0; flex-wrap:wrap; }
-.stat-card {
-    background:#f8f9fa; border-left:4px solid var(--red);
-    padding:.5rem 1rem; border-radius:4px;
-    font-size:.83rem; flex:1; min-width:140px;
-}
-.api-info {
-    background:#eaf4fb; border-left:4px solid #2980b9;
-    padding:.5rem 1rem; border-radius:4px;
-    font-size:.82rem; margin-bottom:.8rem;
-}
+:root{--red:#c0392b;--dark:#1e1e2e;--text:#cdd6f4;--border:#313244}
+.main-title{text-align:center;font-size:2.2rem;font-weight:800;color:var(--red);margin-bottom:0}
+.sub-title{text-align:center;color:#7f8c8d;font-style:italic;margin-top:0;margin-bottom:1.2rem}
+.result-box{background:var(--dark);color:var(--text);padding:1rem 1.2rem;border-radius:10px;
+  font-size:.92rem;line-height:1.75;white-space:pre-wrap;max-height:420px;overflow-y:auto;
+  border:1px solid var(--border)}
+.stat-row{display:flex;gap:1rem;margin:.5rem 0;flex-wrap:wrap}
+.stat-card{background:#f8f9fa;border-left:4px solid var(--red);padding:.5rem 1rem;
+  border-radius:4px;font-size:.83rem;flex:1;min-width:140px}
+.provider-primary{background:#eaf4fb;border-left:4px solid #2980b9;
+  padding:.5rem 1rem;border-radius:4px;font-size:.82rem;margin-bottom:.5rem}
+.provider-fallback{background:#fef9e7;border-left:4px solid #f39c12;
+  padding:.5rem 1rem;border-radius:4px;font-size:.82rem;margin-bottom:.5rem}
+.badge-used{display:inline-block;padding:.15rem .5rem;border-radius:9999px;
+  font-size:.72rem;font-weight:700;margin-left:.4rem;vertical-align:middle}
+.badge-primary{background:#2980b9;color:#fff}
+.badge-fallback{background:#e67e22;color:#fff}
 </style>
 """, unsafe_allow_html=True)
 
 st.markdown('<p class="main-title">⚔️ Dịch Thuật Tiên Hiệp</p>', unsafe_allow_html=True)
-st.markdown('<p class="sub-title">Trung Hoa → Tiếng Việt · Văn phong cổ phong · Tự động kiểm tra & vá chữ Hán sót</p>', unsafe_allow_html=True)
+st.markdown('<p class="sub-title">Trung Hoa → Tiếng Việt · Tự động fallback khi API lỗi · Kiểm tra & vá chữ Hán sót</p>', unsafe_allow_html=True)
 
-# ── Sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.header("⚙️ Cài đặt")
 
-    st.markdown(
-        '<div class="api-info">🔑 API: <b>platform.beeknoee.com</b></div>',
-        unsafe_allow_html=True,
-    )
-
-    api_key = st.text_input(
-        "API Key",
-        type="password",
-        placeholder="Nhập key từ platform.beeknoee.com…",
-    )
-
-    # Model selector — fetch list or manual input
-    model_input_mode = st.radio("Chọn model", ["Tự động lấy danh sách", "Nhập tay"], horizontal=True)
-
-    model = ""
-    if model_input_mode == "Tự động lấy danh sách":
-        fetch_btn = st.button("🔄 Lấy danh sách model", use_container_width=True)
-        if fetch_btn:
-            if not api_key:
-                st.error("Nhập API key trước.")
-            else:
-                with st.spinner("Đang lấy danh sách…"):
-                    model_list = fetch_models(api_key)
-                if model_list:
-                    st.session_state["model_list"] = model_list
-                    st.success(f"✅ Tìm thấy {len(model_list)} model")
+    st.markdown('<div class="provider-primary">🔵 <b>Provider chính</b> — platform.beeknoee.com</div>', unsafe_allow_html=True)
+    p_key = st.text_input("API Key (beeknoee)", type="password", placeholder="sk-…", key="p_key")
+    p_model_mode = st.radio("Model (chính)", ["Tự động lấy", "Nhập tay"], horizontal=True, key="p_mode")
+    p_model = ""
+    if p_model_mode == "Tự động lấy":
+        if st.button("🔄 Lấy model", key="p_fetch", use_container_width=True):
+            if p_key:
+                with st.spinner("Đang lấy…"):
+                    ml = fetch_models(p_key, PRIMARY_BASE_URL)
+                if ml:
+                    st.session_state["p_model_list"] = ml
+                    st.success(f"✅ {len(ml)} model")
                 else:
-                    st.warning("Không lấy được danh sách. Hãy nhập tay.")
-
-        if "model_list" in st.session_state and st.session_state["model_list"]:
-            model = st.selectbox("Model", st.session_state["model_list"])
+                    st.warning("Không lấy được. Nhập tay.")
+        if st.session_state.get("p_model_list"):
+            p_model = st.selectbox("", st.session_state["p_model_list"], key="p_sel")
         else:
-            st.caption("Nhấn nút trên để tải danh sách model.")
+            st.caption("Nhấn nút trên để tải danh sách.")
     else:
-        model = st.text_input("Tên model", placeholder="vd: gpt-4o, claude-3-5-sonnet…")
+        p_model = st.text_input("Tên model", placeholder="vd: gpt-4o", key="p_manual")
+
+    st.divider()
+
+    st.markdown('<div class="provider-fallback">🟡 <b>Fallback</b> — DS2API (DeepSeek)</div>', unsafe_allow_html=True)
+    fb_enabled = st.toggle("Bật fallback DS2API", value=False, key="fb_on")
+
+    fb_url = fb_key = fb_model = ""
+    if fb_enabled:
+        fb_url = st.text_input("DS2API URL", placeholder="https://your-ds2api.vercel.app/v1", key="fb_url")
+        fb_key = st.text_input("DS2API Key", type="password", placeholder="sk-mykey123", key="fb_key")
+        fb_model_mode = st.radio("Model (fallback)", ["Tự động lấy", "Nhập tay"], horizontal=True, key="fb_mode")
+        if fb_model_mode == "Tự động lấy":
+            if st.button("🔄 Lấy model", key="fb_fetch", use_container_width=True):
+                if fb_key and fb_url:
+                    with st.spinner("Đang lấy…"):
+                        ml = fetch_models(fb_key, fb_url)
+                    if ml:
+                        st.session_state["fb_model_list"] = ml
+                        st.success(f"✅ {len(ml)} model")
+                    else:
+                        st.warning("Không lấy được. Nhập tay.")
+            if st.session_state.get("fb_model_list"):
+                fb_model = st.selectbox("", st.session_state["fb_model_list"], key="fb_sel")
+            else:
+                st.caption("Nhấn nút trên để tải danh sách.")
+        else:
+            fb_model = st.text_input("Tên model", placeholder="deepseek-v4-flash-nothinking", key="fb_manual")
 
     st.divider()
     chunk_size = st.slider("Chunk size (ký tự)", 500, 6000, 2000, 100)
     delay      = st.slider("Delay giữa chunk (giây)", 0.0, 5.0, 0.3, 0.1)
     do_check   = st.toggle("🔍 Kiểm tra & vá chữ Hán sót", value=True)
 
-    st.divider()
-    st.markdown("""**Quy trình:**
-1. Nhập API key → lấy danh sách model
-2. Upload nhiều file `.txt`
-3. Nhấn **Dịch Thuật**
-4. Tự kiểm tra & vá chữ Hán sót từng dòng
-5. Tải từng file hoặc **tất cả (ZIP)**""")
-
-
-# ── Input tabs ────────────────────────────────────────────────────────────────
 tab_file, tab_text = st.tabs(["📁 Upload nhiều File .txt", "✏️ Dán Văn Bản"])
 uploaded_list = []
 
 with tab_file:
-    files = st.file_uploader(
-        "Chọn một hoặc nhiều file .txt tiếng Trung",
-        type=["txt"],
-        accept_multiple_files=True,
-        help="Hỗ trợ UTF-8 / GBK / GB2312 / Big5",
-    )
+    files = st.file_uploader("Chọn một hoặc nhiều file .txt tiếng Trung",
+        type=["txt"], accept_multiple_files=True)
     if files:
         for f in files:
             raw = f.read()
             decoded = None
             for enc in ("utf-8", "gb18030", "gbk", "big5"):
                 try:
-                    decoded = raw.decode(enc)
-                    break
+                    decoded = raw.decode(enc); break
                 except UnicodeDecodeError:
                     continue
             if decoded:
                 uploaded_list.append((f.name, decoded))
             else:
-                st.error(f"❌ Không đọc được `{f.name}` — hãy chuyển sang UTF-8.")
+                st.error(f"❌ Không đọc được `{f.name}`")
         if uploaded_list:
-            st.success(f"✅ Đọc thành công **{len(uploaded_list)}** file")
-            with st.expander("Xem danh sách"):
+            st.success(f"✅ {len(uploaded_list)} file")
+            with st.expander("Danh sách file"):
                 for name, txt in uploaded_list:
                     st.markdown(f"- **{name}** — {len(txt):,} ký tự")
 
@@ -256,155 +247,123 @@ with tab_text:
     if pasted.strip():
         uploaded_list = [("van_ban_dan.txt", pasted.strip())]
 
-
-# ── Translate ─────────────────────────────────────────────────────────────────
 st.divider()
 translate_btn = st.button("🔄 Bắt Đầu Dịch Thuật", type="primary", use_container_width=True)
 
 if translate_btn:
-    if not api_key:
-        st.error("⛔ Vui lòng nhập **API Key** ở sidebar.")
-        st.stop()
-    if not model:
-        st.error("⛔ Vui lòng chọn hoặc nhập **tên model**.")
+    providers = []
+    if p_key and p_model:
+        providers.append(Provider("beeknoee", PRIMARY_BASE_URL, p_key, p_model))
+    if fb_enabled and fb_url and fb_key and fb_model:
+        providers.append(Provider("ds2api", fb_url, fb_key, fb_model))
+
+    if not providers:
+        st.error("⛔ Chưa cấu hình provider nào. Nhập API key + model ở sidebar.")
         st.stop()
     if not uploaded_list:
         st.error("⛔ Chưa có file / văn bản để dịch.")
         st.stop()
 
-    client  = OpenAI(api_key=api_key, base_url=API_BASE_URL)
     results = [FileResult(name=n, source=t) for n, t in uploaded_list]
+    provider_usage = {p.name: 0 for p in providers}
 
-    st.markdown(f"""
-    <div class="stat-row">
-      <div class="stat-card">📂 Số file: <b>{len(results)}</b></div>
-      <div class="stat-card">🤖 Model: <b>{model}</b></div>
+    st.markdown(f"""<div class="stat-row">
+      <div class="stat-card">📂 File: <b>{len(results)}</b></div>
+      <div class="stat-card">🔗 Providers: <b>{" → ".join(p.name for p in providers)}</b></div>
       <div class="stat-card">📏 Chunk: <b>{chunk_size:,} ký tự</b></div>
-      <div class="stat-card">🔍 Kiểm tra Hán: <b>{"Bật" if do_check else "Tắt"}</b></div>
-    </div>
-    """, unsafe_allow_html=True)
+      <div class="stat-card">🔍 Hán check: <b>{"Bật" if do_check else "Tắt"}</b></div>
+    </div>""", unsafe_allow_html=True)
 
-    # Build per-file UI containers
     file_containers = []
     for r in results:
         with st.expander(f"📄 {r.name}", expanded=True):
-            c_status   = st.empty()
-            c_progress = st.empty()
-            c_result   = st.empty()
-            c_check    = st.empty()
-            c_dl       = st.empty()
-        file_containers.append((c_status, c_progress, c_result, c_check, c_dl))
+            file_containers.append((st.empty(), st.empty(), st.empty(), st.empty(), st.empty()))
 
-    # ── Translate each file ───────────────────────────────────────────────────
     for idx, r in enumerate(results):
         c_status, c_progress, c_result, c_check, c_dl = file_containers[idx]
-        r.status = "translating"
         chunks = split_text(r.source, chunk_size)
         r.chunks_total = len(chunks)
-        parts  = []
-
-        c_status.info(f"⏳ **{r.name}** — dịch {len(chunks)} chunk…")
+        parts = []
+        c_status.info(f"⏳ **{r.name}** — {len(chunks)} chunk…")
 
         for i, chunk in enumerate(chunks):
             c_progress.progress(i / len(chunks), text=f"Chunk {i+1}/{len(chunks)}")
-            translated, err = api_with_retry(client, model, chunk, status_ph=c_status)
-            parts.append(translated if not err else f"[LỖI CHUNK {i+1}: {err}]")
+            translated, used, err = call_with_fallback(providers, chunk, status_ph=c_status)
             if err:
                 r.errors.append(f"Chunk {i+1}: {err}")
-            r.chunks_done = i + 1
+                parts.append(f"[LỖI CHUNK {i+1}: {err}]")
+                badge = ""
+            else:
+                parts.append(translated)
+                if used:
+                    provider_usage[used] = provider_usage.get(used, 0) + 1
+                badge_cls = "badge-primary" if used == "beeknoee" else "badge-fallback"
+                badge = f'<span class="badge-used {badge_cls}">{used}</span>'
 
             live = "\n\n".join(parts)
             c_result.markdown(
-                f'<div class="result-box">{live.replace(chr(10), "<br>")}</div>',
-                unsafe_allow_html=True,
-            )
+                f'<div class="result-box">Chunk {i+1}/{len(chunks)} {badge}<br><br>'
+                f'{live.replace(chr(10), "<br>")}</div>', unsafe_allow_html=True)
+            r.chunks_done = i + 1
             if delay > 0 and i < len(chunks) - 1:
                 time.sleep(delay)
 
         c_progress.progress(1.0, text="✅ Dịch xong")
         r.translated = "\n\n".join(parts)
 
-        # ── Check & fix leftover Han ──────────────────────────────────────────
         if do_check:
-            r.status = "checking"
             han_segs = find_han_segments(r.translated)
             r.han_found = len(han_segs)
-
             if not han_segs:
-                c_check.success(f"✅ Không còn chữ Hán sót trong **{r.name}**.")
+                c_check.success("✅ Không còn chữ Hán sót.")
                 r.fixed = r.translated
             else:
-                c_check.warning(f"⚠️ Phát hiện **{r.han_found}** dòng còn chữ Hán — đang vá…")
-                r.status = "fixing"
+                c_check.warning(f"⚠️ {r.han_found} dòng còn chữ Hán — đang vá…")
                 lines = r.translated.split("\n")
                 fix_ph = st.empty()
-
                 for fi, (li, bad_line) in enumerate(han_segs):
-                    fix_ph.caption(
-                        f"🔧 Vá dòng {fi+1}/{r.han_found}: `{bad_line[:60]}{'…' if len(bad_line)>60 else ''}`"
-                    )
-                    fixed_line, err = api_with_retry(
-                        client, model, bad_line,
-                        system=SYSTEM_PROMPT_FIX,
-                        status_ph=c_check,
-                    )
+                    fix_ph.caption(f"🔧 Vá {fi+1}/{r.han_found}: `{bad_line[:60]}{'…' if len(bad_line)>60 else ''}`")
+                    fixed_line, used, err = call_with_fallback(providers, bad_line, SYSTEM_PROMPT_FIX, c_check)
                     if not err and fixed_line.strip():
                         lines[li] = fixed_line
                         r.han_fixed += 1
                     if delay > 0:
                         time.sleep(delay)
-
                 fix_ph.empty()
                 r.fixed = "\n".join(lines)
-
                 remaining = find_han_segments(r.fixed)
                 if remaining:
-                    c_check.warning(
-                        f"⚠️ Đã vá **{r.han_fixed}/{r.han_found}** dòng. "
-                        f"Còn **{len(remaining)}** dòng (có thể là tên riêng/tiêu đề)."
-                    )
+                    c_check.warning(f"⚠️ Đã vá {r.han_fixed}/{r.han_found}. Còn {len(remaining)} dòng (tên riêng).")
                 else:
-                    c_check.success(f"✅ Đã vá toàn bộ **{r.han_fixed}** dòng sót!")
+                    c_check.success(f"✅ Vá xong {r.han_fixed} dòng!")
         else:
             r.fixed = r.translated
 
         r.status = "done"
-        c_status.success(f"🎉 **{r.name}** — hoàn tất!")
+        usage_str = " | ".join(f"{n}: {c} chunk" for n, c in provider_usage.items() if c > 0)
+        c_status.success(f"🎉 **{r.name}** hoàn tất! ({usage_str})")
         stem = r.name.rsplit(".", 1)[0]
-        c_dl.download_button(
-            label=f"⬇️ Tải {stem}_vi.txt",
-            data=r.final_text.encode("utf-8"),
-            file_name=f"{stem}_vi.txt",
-            mime="text/plain",
-            key=f"dl_{idx}",
-        )
+        c_dl.download_button(f"⬇️ Tải {stem}_vi.txt", r.final_text.encode("utf-8"),
+            f"{stem}_vi.txt", "text/plain", key=f"dl_{idx}")
 
-    # ── Download ALL zip ──────────────────────────────────────────────────────
     done = [r for r in results if r.status == "done"]
     if len(done) > 1:
         st.divider()
-        st.download_button(
-            label=f"📦 Tải tất cả {len(done)} file (ZIP)",
-            data=build_zip(done),
-            file_name="ban_dich_tien_hiep.zip",
-            mime="application/zip",
-            use_container_width=True,
-            type="primary",
-        )
+        st.download_button(f"📦 Tải tất cả {len(done)} file (ZIP)", build_zip(done),
+            "ban_dich_tien_hiep.zip", "application/zip", use_container_width=True, type="primary")
 
-    # ── Summary ───────────────────────────────────────────────────────────────
     st.divider()
     st.markdown("### 📊 Tổng kết")
-    cols = st.columns(max(len(results), 1))
-    for col, r in zip(cols, results):
-        with col:
-            icon = "🟢" if r.status == "done" else "🔴"
-            st.markdown(f"**{icon} {r.name}**")
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Tổng file", len(results))
+    c2.metric("Tổng chunk", sum(r.chunks_total for r in results))
+    c3.metric("beeknoee", provider_usage.get("beeknoee", 0))
+    c4.metric("ds2api", provider_usage.get("ds2api", 0))
+    for r in results:
+        with st.expander(f"{'🟢' if r.status=='done' else '🔴'} {r.name}"):
             st.markdown(f"- Chunks: {r.chunks_done}/{r.chunks_total}")
             if do_check:
-                st.markdown(f"- Hán sót: {r.han_found} dòng")
-                st.markdown(f"- Đã vá: {r.han_fixed} dòng")
+                st.markdown(f"- Hán sót: {r.han_found} | Đã vá: {r.han_fixed}")
             if r.errors:
-                with st.expander(f"⚠️ {len(r.errors)} lỗi"):
-                    for e in r.errors:
-                      st.text(e)
+                for e in r.errors:
+                    st.text(e)
